@@ -2,49 +2,57 @@ import requests
 import pandas as pd
 from datetime import datetime
 
-# === قیمت لحظه‌ای از نوبیتکس ===
-def get_spot_price(symbol: str = "BTCUSDT") -> float:
-    """
-    قیمت لحظه‌ای اسپات رو از Nobitex میاره.
-    """
-    url = f"https://api.nobitex.ir/v2/orderbook/{symbol.lower()}"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+
+def get_spot_price():
+    """Spot price با Failover: اول Binance → بعد CoinGecko"""
     try:
-        r = requests.get(url, timeout=10)
+        # Binance
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+        r.raise_for_status()
+        return float(r.json()["price"])
+    except Exception:
+        # CoinGecko
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=5)
+        r.raise_for_status()
+        return float(r.json()["bitcoin"]["usd"])
+
+
+def get_recent_minutes(symbol="BTCUSDT", interval="15m", limit=240):
+    """
+    OHLCV دیتا با Failover:
+    - اول Binance
+    - بعد CoinGecko (فقط close و volume → high/low رو با close پر می‌کنیم)
+    """
+    try:
+        # Binance
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(BINANCE_URL, params=params, timeout=5)
         r.raise_for_status()
         data = r.json()
-        return float(data["lastTradePrice"])
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch spot price from Nobitex: {e}")
-
-
-# === دریافت کندل‌ها (OHLCV) از نوبیتکس ===
-def get_recent_minutes(symbol: str = "BTCUSDT", limit: int = 240) -> pd.DataFrame:
-    """
-    OHLCV دیتای دقیقه‌ای از Nobitex
-    """
-    url = "https://api.nobitex.ir/market/candles"
-    payload = {
-        "symbol": symbol.lower(),
-        "resolution": "1",   # 1 دقیقه‌ای
-        "limit": str(limit)
-    }
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        if "candles" not in data or not data["candles"]:
-            raise ValueError("No candle data in response")
-
-        # ساخت DataFrame
-        df = pd.DataFrame(data["candles"], columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df = df.astype({
-            "open": float, "high": float, "low": float,
-            "close": float, "volume": float
-        })
-        df.set_index("time", inplace=True)
+        df = pd.DataFrame(data, columns=[
+            "timestamp","open","high","low","close","volume",
+            "_1","_2","_3","_4","_5","_6"
+        ])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df[["timestamp","open","high","low","close","volume"]].astype(float)
         return df
 
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch OHLCV from Nobitex: {e}")
+    except Exception:
+        # CoinGecko (returns 5-min candles, so may differ a bit)
+        r = requests.get(COINGECKO_URL, params={"vs_currency": "usd", "days": "7"}, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+
+        prices = data["prices"]  # [ [timestamp, price], ... ]
+        volumes = data["total_volumes"]
+
+        df = pd.DataFrame(prices, columns=["timestamp","close"])
+        df["volume"] = [v[1] for v in volumes]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df["open"] = df["close"]
+        df["high"] = df["close"]
+        df["low"]  = df["close"]
+
+        return df.tail(limit)
